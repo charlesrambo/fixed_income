@@ -1,0 +1,218 @@
+
+import numpy as np
+from scipy.optimize import fsolve
+
+
+# Create alpha function
+def get_alpha(dt, dz, r, q, sigma):
+    
+    factor = 1/(1 + r * dt) 
+    inner_term0 = -dt/(2 * dz) * (r - q - 0.5 * sigma**2)
+    inner_term1 =  dt/(2 * dz**2) * sigma**2
+    
+    return factor * (inner_term0 + inner_term1)
+
+
+# Create beta function
+def get_beta(dt, dz, r, q, sigma):
+    
+    factor0 = 1/(1 + r * dt)
+    factor1 = 1 - dt/dz**2 * sigma**2
+    
+    return factor0 * factor1
+
+
+# Create gamma function
+def get_gamma(dt, dz, r , q, sigma):
+    
+    factor = 1/(1 + r * dt)
+    inner_term0 = dt/(2 * dz) * (r - q - 0.5 * sigma**2)
+    inner_term1 = dt/(2 * dz**2) * sigma**2
+
+    return factor * (inner_term0 + inner_term1)
+
+
+ # Create function to calculate price of convertible using finite difference method    
+def fd_cvt_hazard(stock, tenor, coupon, eff_trigger, protection, hazard_rate, 
+                      recovery_rate, vol, div, forward_fun, M = 200, N = None):
+        """
+        Parameters
+        ----------
+        stock : float
+            Stock value per $100 of par. Typically 0.1 times stock price times 
+            conversion ratio.
+        tenor : float
+            Time until maturity in days
+        coupon: float
+            Annual coupon payment per $100 of par. Assumed to be paid semiannually.
+        eff_trigger : float
+            Soft callable if stock is above 130% of par 20 of the last 30 days. 
+            Typically calculated via Monte Carlo simulation. Quoted per $100 of 
+            par. Tends to be around 145.
+        protection : float 
+            Time until soft call protection ends divided by tenor. For example, if
+            tenor = 4 and the time until soft call starts is 2, then 
+            protection = 0.5
+        hazard_rate: float
+            Weighted average hazard rate over tenor.
+        recovery_rate: float
+            Recovery rate of bond in case of default. Written as a percent.
+        vol: float
+            Implied volatility. This calculation does not use a volatility 
+            surface but the extension is trivial.
+        div: float
+            Dividend yield written as a percent. Assumed to be quarterly 
+            calculation converts yield into continuous rate
+        forward_fun: function
+            The forward curve. Assumed to be vectorized. For example, could use
+            forward_fun = np.vectorize(lambda t, T: 0.05) for a flat term-structure
+        M: int
+            Divides tenor into M steps of length tenor/M
+        N: int
+            Divides log of stock price into 2N steps
+            
+        Returns
+        -------
+        Convertible price
+        """
+
+        # IMPORTANT STEP!!! 
+        
+        # Define probability of default cdf
+        def cdf(t):
+                
+            if t > 0:
+                
+                return 1.0 - np.exp(-hazard_rate * t)
+            
+            else:
+                
+                return 0
+        
+        # If N is None...
+        if N is None:
+            
+            # ... make it half of M
+            N = int(0.5 * M + 1)
+        
+        # Convert volatility to a decimal
+        vol *= 0.01
+        
+        # Convert dividend to decimal and make continuous
+        div = np.log(1 + 0.01 * div)
+        
+        # Convert the tenor to years
+        tenor *= 1/365
+       
+        # Multiply ratio by tenor
+        protection *= tenor
+        
+        # Calculate the time step
+        dt = tenor/M
+        
+        # Calculate the riskfree forward rates; forward_fun must be vectorized
+        rates_rf = forward_fun(dt * np.arange(0, M + 1),  
+                               dt * np.arange(1, M + 2))
+        
+        # Calculate the log of the stock price
+        Z = np.log(stock)
+        
+        # Calculate the Z step size
+        dz = vol * np.sqrt(3 * dt)
+        
+        # Create a grid of possible Z-values
+        grid = Z + np.arange(-N * dz, (N + 1) * dz, dz)
+        
+        # Calculate rates
+        rates_rf = np.tile(rates_rf, (len(grid), 1))
+      
+        # Compute the coefficents for the recursive calculation
+        alphas = get_alpha(dt, dz, rates_rf, div, vol)
+        betas = get_beta(dt, dz, rates_rf, div, vol)
+        gammas = get_gamma(dt, dz, rates_rf, div, vol)
+        
+        # Initialize the array of values
+        V = np.zeros((len(grid), M + 1))      
+ 
+        # IMPORTANT STEP!!!
+            
+        # Calculate expected value at maturity using cdf
+        V[:, -1] = (coupon/2 + 100) * (1 - cdf(tenor)) + recovery_rate * (cdf(tenor) - cdf(tenor - dt))
+        
+        # If stock price is high enough convert
+        V[:, -1] = np.max([V[:, -1], np.exp(grid)], axis = 0)
+        
+        # Get the coupon payment times
+        coupon_pmts = np.arange(tenor, 0, -0.5)
+        
+        # Loop from maturity backward
+        for i in range(M, 0, -1):
+            
+            # For the largest Z-value, use linear extrapolation
+            V[-1, i - 1] = (alphas[-2, i - 1] * V[-2, i] + betas[-1, i - 1] * V[-1, i] 
+                            + (2 * gammas[-1, i - 1] - gammas[-2, i - 1]) * (2 * V[-1, i] - V[-2, i]))
+            
+            # For the other values, just follow the script
+            V[1:-1, i - 1] = (alphas[:-2, i - 1] * V[:-2, i] + betas[1:-1, i - 1] * V[1:-1, i] 
+                              + gammas[2:, i - 1] * V[2:, i])
+            
+            # Assume no change for the lowest level; already at the bond floor
+            V[0, i - 1] = V[1, i - 1]
+            
+            # IMPORTANT STEP!!!
+            
+            # NOTE: Definition of cdf implies prob 0 to default at t = 0 or earlier
+            
+            # Add in expected cash flows
+            
+            # If coupon payment... 
+            if np.min(np.abs(coupon_pmts - (i - 1) * dt)) < dt/2:
+                 
+                # ... then calculate expected value with coupon
+                V[:, i - 1] += coupon/2 * (1 - cdf(i * dt - dt)) + recovery_rate * (cdf(i * dt - dt) - cdf(i * dt - 2 * dt))  
+            
+            # Otherwise...
+            else:
+                
+                # ... expected payment is just recovery rate times probability
+                V[:, i - 1] += recovery_rate * (cdf(i * dt - dt) - cdf(i * dt - 2 * dt))    
+                          
+            # If there is no call protection get observations where exercise is available
+            can_ex = (np.exp(grid) > eff_trigger) & (i * dt > protection)
+            
+            # If both true then bond exercised; note bond always more valuabe than par in this case
+            V[:, i - 1] = np.where(can_ex, 100, V[:, i - 1])
+                
+            # The conversion is American style
+            V[:, i - 1] = np.max([np.exp(grid), V[:, i - 1]], axis = 0)
+       
+        # The price we care about is in the center          
+        cvt_price = V[N, 0]
+            
+        return cvt_price
+    
+      
+def get_risk_neutral_default_prob(cvt_price, stock, tenor, coupon, eff_trigger, 
+                                  protection, recovery_rate, vol, div, 
+                                  forward_fun, M = 200, N = None, maxfev = 50, 
+                                  xtol = 1e-3):
+    
+    # Define objective function
+    obj = lambda hazard_rate: cvt_price - fd_cvt_hazard(stock, tenor, coupon, 
+                                                        eff_trigger, protection, 
+                                                        hazard_rate, 
+                                                        recovery_rate, 
+                                                        vol, div, forward_fun, 
+                                                        M = M, N = N)
+    
+    try:
+        
+        # Use f solve to find hazard rate
+        res = fsolve(func = obj, x0 = 0.04, xtol = xtol, maxfev = maxfev)[0]
+        
+        # Use hazard rate to calculate default probability
+        return np.max([1 - np.exp(-res * tenor/365), 0.0])
+    
+    except:
+        
+        return np.nan
